@@ -1,0 +1,7 @@
+# P100 fixes on top of the base image (kept separate so the 13 GB base does not have to be rebuilt):
+#  - TORCH_DISABLE_NATIVE_JIT=1: PyTorch 2.14 otherwise tries to compile a Triton kernel and fails (no C compiler).
+#  - patch_int8.py: tell ComfyUI that Pascal has no INT8 matrix multiply, so int8 model files are converted to float.
+FROM p100-imagegen:latest
+ENV TORCH_DISABLE_NATIVE_JIT=1
+COPY patch_int8.py /tmp/patch_int8.py
+RUN python /tmp/patch_int8.py

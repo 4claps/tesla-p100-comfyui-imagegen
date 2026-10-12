@@ -1,0 +1,7 @@
+diffusion_models flux-2-klein-base-4b.safetensors https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/diffusion_models/flux-2-klein-base-4b.safetensors
+diffusion_models qwen_image_2.1_int8_convrot.safetensors https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors
+text_encoders qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors
+vae qwen_image_vae.safetensors https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors
+loras krea2_darkbrush.safetensors https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_darkbrush.safetensors
+text_encoders qwen3vl_4b_fp8_scaled.safetensors https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
+diffusion_models krea2_turbo_int8_convrot.safetensors https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors
