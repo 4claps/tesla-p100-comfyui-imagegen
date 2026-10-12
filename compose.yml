@@ -1,0 +1,35 @@
+# Four ComfyUI instances, one per P100, ports 8188-8191. Not started by default and not auto-restarting:
+# an image model takes 12-13 GB of a 16 GB card, so the cards cannot be shared with another job that fills them.
+#   docker compose -f compose.yml up -d          # all four
+#   docker compose -f compose.yml up -d comfy0   # one card
+# --fast-disk keeps model weights disk-backed so four processes fit in 15 GB of host RAM.
+x-comfy: &comfy
+  image: p100-imagegen:p100
+  environment:
+    TORCH_DISABLE_NATIVE_JIT: "1"
+  volumes:
+    - /data/imagegen/models:/opt/ComfyUI/models
+    - /data/imagegen/out:/opt/ComfyUI/output
+  command: ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--fast-disk"]
+
+services:
+  comfy0:
+    <<: *comfy
+    container_name: comfy0
+    ports: ["8188:8188"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]}}}
+  comfy1:
+    <<: *comfy
+    container_name: comfy1
+    ports: ["8189:8188"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["1"], capabilities: [gpu]}]}}}
+  comfy2:
+    <<: *comfy
+    container_name: comfy2
+    ports: ["8190:8188"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["2"], capabilities: [gpu]}]}}}
+  comfy3:
+    <<: *comfy
+    container_name: comfy3
+    ports: ["8191:8188"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["3"], capabilities: [gpu]}]}}}
