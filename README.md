@@ -3,7 +3,7 @@
 New here and just want a picture? Start with `QUICKSTART.md`.
 
 Everything GPU-side runs in a container built from these files. Models and outputs live on the GPU host under
-`/data/imagegen/{models,out}` and are mounted in. Results are in `RESULTS.md`, web research in `RESEARCH.md`.
+`/data/imagegen/{models,out}` and are mounted in. Results are in `RESULTS.md`, web research in `RESEARCH.md`, the stable-diffusion.cpp comparison in `SDCPP.md`.
 
 ## Files
 | File | What it is |
@@ -18,6 +18,7 @@ Everything GPU-side runs in a container built from these files. Models and outpu
 | `mkindex.py` | Builds one browse page for everything in the output folder |
 | `samples/` | A few of the generated pictures and clips (see below) |
 | `opbench.py` | Per-operation fp32/fp16/bf16 timing |
+| `SDCPP.md`, `sdcpp/` | stable-diffusion.cpp instead of ComfyUI: results, a Dockerfile, a benchmark client and a tensor-parallel patch that splits one image across 2 or 4 cards (klein in ~9 s, Z-Image in ~25 s on four) |
 
 ## Quick use
 ```
