@@ -1,0 +1,289 @@
+diff --git a/src/core/ggml_extend_backend.cpp b/src/core/ggml_extend_backend.cpp
+index 9e57efa..4417a4f 100644
+--- a/src/core/ggml_extend_backend.cpp
++++ b/src/core/ggml_extend_backend.cpp
+@@ -3,7 +3,10 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <cstdlib>
++#include <cstring>
+ #include <mutex>
++#include <numeric>
++#include <regex>
+ #include <sstream>
+ #include <stdexcept>
+ #include <utility>
+@@ -370,11 +373,17 @@ static std::string get_default_backend_name() {
+     return resolve_first_device_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+ }
+ 
++static bool is_tp_backend_token(const std::string& name);
++
+ std::string sd_backend_resolve_name(const std::string& name) {
+     ggml_backend_load_all_once();
+     std::string requested = trim_copy(name);
+     std::string lower     = lower_copy(requested);
+ 
++    if (is_tp_backend_token(lower)) {
++        return "tp";
++    }
++
+     if (is_default_backend_token(lower)) {
+         return get_default_backend_name();
+     }
+@@ -412,7 +421,145 @@ std::string sd_backend_resolve_name(const std::string& name) {
+ }
+ 
+ static bool backend_name_exists(const std::string& name) {
+-    return !sd_backend_resolve_name(name).empty();
++    return is_tp_backend_token(name) || !sd_backend_resolve_name(name).empty();
++}
++
++// Tensor parallelism for diffusion transformers on the ggml meta backend (backend token "tp").
++// The devices come from SD_TP_DEVICES (comma-separated ggml device names, default "CUDA0,CUDA1").
++// Weights of the FLUX-style blocks are split like llama.cpp's -sm tensor: the fused qkv, mlp-in and
++// single-block linear1 by output rows, the attention projection, mlp-out and linear2 by input
++// columns (their outputs are then partial sums that the meta backend all-reduces). Everything else
++// is mirrored on every device. Z-Image blocks are split the same way (fused qkv and w1/w3 by rows,
++// attention out and w2 by columns).
++static bool is_tp_backend_token(const std::string& name) {
++    return lower_copy(trim_copy(name)) == "tp";
++}
++
++static size_t sd_tp_n_devices = 0;
++
++static ggml_backend_meta_split_state sd_tp_get_split_state(const ggml_tensor* tensor, void* userdata) {
++    (void)userdata;
++    static const std::regex re_qkv_w("(^|\\.)(img|txt)_attn\\.qkv\\.weight$");
++    static const std::regex re_qkv_b("(^|\\.)(img|txt)_attn\\.qkv\\.bias$");
++    static const std::regex re_proj_w("(^|\\.)(img|txt)_attn\\.proj\\.weight$");
++    static const std::regex re_mlp_in_w("(^|\\.)(img|txt)_mlp\\.0\\.weight$");
++    static const std::regex re_mlp_in_b("(^|\\.)(img|txt)_mlp\\.0\\.bias$");
++    static const std::regex re_mlp_out_w("(^|\\.)(img|txt)_mlp\\.2\\.weight$");
++    static const std::regex re_lin1_w("(^|\\.)single_blocks\\.\\d+\\.linear1\\.weight$");
++    static const std::regex re_lin1_b("(^|\\.)single_blocks\\.\\d+\\.linear1\\.bias$");
++    static const std::regex re_lin2_w("(^|\\.)single_blocks\\.\\d+\\.linear2\\.weight$");
++    // Z-Image: layers / noise_refiner / context_refiner blocks with a fused qkv and a SwiGLU feed-forward
++    static const std::regex re_z_qkv_w("(^|\\.)attention\\.qkv\\.weight$");
++    static const std::regex re_z_out_w("(^|\\.)attention\\.out\\.weight$");
++    static const std::regex re_z_ff_in_w("(^|\\.)feed_forward\\.w[13]\\.weight$");
++    static const std::regex re_z_ff_out_w("(^|\\.)feed_forward\\.w2\\.weight$");
++
++    const std::string name = tensor->name;
++    const size_t n_dev     = sd_tp_n_devices;
++
++    ggml_backend_meta_split_state st;
++    memset(&st, 0, sizeof(st));
++    st.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
++    st.nr[0]      = 1;
++    st.n_segments = 1;
++
++    int axis = -1;
++    std::vector<std::pair<int64_t, uint32_t>> segments;  // (size, repeats)
++    if (std::regex_search(name, re_qkv_w)) {
++        axis     = 1;
++        segments = {{tensor->ne[1] / 3, 3}};
++    } else if (std::regex_search(name, re_qkv_b)) {
++        axis     = 0;
++        segments = {{tensor->ne[0] / 3, 3}};
++    } else if (std::regex_search(name, re_z_qkv_w)) {
++        axis     = 1;
++        segments = {{tensor->ne[1] / 3, 3}};
++    } else if (std::regex_search(name, re_z_out_w) || std::regex_search(name, re_z_ff_out_w)) {
++        axis     = 0;
++        segments = {{tensor->ne[0], 1}};
++    } else if (std::regex_search(name, re_z_ff_in_w)) {
++        axis     = 1;
++        segments = {{tensor->ne[1], 1}};
++    } else if (std::regex_search(name, re_proj_w) || std::regex_search(name, re_mlp_out_w)) {
++        axis     = 0;
++        segments = {{tensor->ne[0], 1}};
++    } else if (std::regex_search(name, re_mlp_in_w)) {
++        axis     = 1;
++        segments = {{tensor->ne[1] / 2, 2}};
++    } else if (std::regex_search(name, re_mlp_in_b)) {
++        axis     = 0;
++        segments = {{tensor->ne[0] / 2, 2}};
++    } else if (std::regex_search(name, re_lin1_w)) {
++        // rows: q, k, v (hidden each), then the fused mlp gate and up halves
++        const int64_t hidden = tensor->ne[0];
++        axis                 = 1;
++        segments             = {{hidden, 3}, {(tensor->ne[1] - 3 * hidden) / 2, 2}};
++    } else if (std::regex_search(name, re_lin1_b)) {
++        // the hidden size is not visible from the bias; take it from linear2's convention (bias length = 3*hidden + 2*mlp)
++        return st;
++    } else if (std::regex_search(name, re_lin2_w)) {
++        // columns: attention output (hidden), then the mlp activation
++        const int64_t hidden = tensor->ne[1];
++        axis                 = 0;
++        segments             = {{hidden, 1}, {tensor->ne[0] - hidden, 1}};
++    }
++    if (axis < 0 || n_dev < 2) {
++        return st;
++    }
++
++    // split in whole 128-wide granules (one attention head; a multiple of every quant block size),
++    // as evenly as possible: 30 heads over 4 devices -> 8, 8, 7, 7
++    const int64_t granularity = std::lcm<int64_t>(ggml_blck_size(tensor->type), 128);
++    for (const auto& seg : segments) {
++        if (seg.first % granularity != 0 || seg.first / granularity < (int64_t)n_dev) {
++            return st;  // not whole heads, or fewer heads than devices: keep it mirrored
++        }
++    }
++    st.axis = (ggml_backend_meta_split_axis)axis;
++    for (size_t is = 0; is < segments.size(); is++) {
++        const int64_t units = segments[is].first / granularity;
++        for (size_t j = 0; j < n_dev; j++) {
++            const int64_t u      = units / (int64_t)n_dev + ((int64_t)j < units % (int64_t)n_dev ? 1 : 0);
++            st.ne[is * n_dev + j] = u * granularity;
++        }
++        st.nr[is] = segments[is].second;
++    }
++    st.n_segments = (uint32_t)segments.size();
++    return st;
++}
++
++static ggml_backend_dev_t sd_tp_meta_device() {
++    static ggml_backend_dev_t meta_dev = nullptr;
++    static std::mutex mtx;
++    std::lock_guard<std::mutex> lock(mtx);
++    if (meta_dev != nullptr) {
++        return meta_dev;
++    }
++    const char* env  = std::getenv("SD_TP_DEVICES");
++    std::string list = env != nullptr && *env ? env : "CUDA0,CUDA1";
++    std::vector<ggml_backend_dev_t> devs;
++    std::stringstream ss(list);
++    std::string item;
++    while (std::getline(ss, item, ',')) {
++        item = trim_copy(item);
++        if (item.empty()) {
++            continue;
++        }
++        ggml_backend_dev_t dev = ggml_backend_dev_by_name(item.c_str());
++        if (dev == nullptr) {
++            LOG_ERROR("tp: device '%s' from SD_TP_DEVICES not found", item.c_str());
++            return nullptr;
++        }
++        devs.push_back(dev);
++    }
++    if (devs.size() < 2) {
++        LOG_ERROR("tp: SD_TP_DEVICES needs at least two devices, got '%s'", list.c_str());
++        return nullptr;
++    }
++    sd_tp_n_devices = devs.size();
++    meta_dev        = ggml_backend_meta_device(devs.data(), devs.size(), sd_tp_get_split_state, nullptr);
++    LOG_INFO("tp: tensor-parallel meta device over %s (%zu devices)", list.c_str(), devs.size());
++    return meta_dev;
+ }
+ 
+ static ggml_backend_t init_named_backend(const std::string& name) {
+@@ -421,6 +568,10 @@ static ggml_backend_t init_named_backend(const std::string& name) {
+     if (trim_copy(name).empty()) {
+         return ggml_backend_init_best();
+     }
++    if (is_tp_backend_token(name)) {
++        ggml_backend_dev_t dev = sd_tp_meta_device();
++        return dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
++    }
+ 
+     if (ggml_backend_dev_t dev = resolve_device_by_name(name)) {
+         return ggml_backend_dev_init(dev, nullptr);
+@@ -1061,7 +1212,7 @@ ggml_backend_buffer_type_t SDBackendManager::split_buffer_type(ggml_backend_t ba
+ 
+ bool SDBackendManager::validate(std::string* error) const {
+     auto validate_single_runtime_name = [&](const std::string& name) -> bool {
+-        if (is_default_backend_token(name)) {
++        if (is_default_backend_token(name) || is_tp_backend_token(name)) {
+             return true;
+         }
+         if (is_disk_backend_token(name)) {
+diff --git a/src/model/diffusion/z_image.hpp b/src/model/diffusion/z_image.hpp
+index ed26440..7aa71d0 100644
+--- a/src/model/diffusion/z_image.hpp
++++ b/src/model/diffusion/z_image.hpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #ifndef __SD_MODEL_DIFFUSION_Z_IMAGE_HPP__
+ #define __SD_MODEL_DIFFUSION_Z_IMAGE_HPP__
+ 
+@@ -23,6 +24,16 @@
+ #endif
+ 
+ namespace ZImage {
++    // SD_ZIMAGE_OUT_PREC_F32=1: run the attention output and FFN w2 projections with f32 accumulation and output.
++    // On Pascal (fast fp16, cuBLAS f16 compute) their f16 outputs overflow and the image comes out blank.
++    static inline bool z_image_out_prec_f32() {
++        static const bool on = [] {
++            const char* env = std::getenv("SD_ZIMAGE_OUT_PREC_F32");
++            return env != nullptr && std::atoi(env) != 0;
++        }();
++        return on;
++    }
++
+     constexpr int Z_IMAGE_GRAPH_SIZE = 20480;
+     constexpr int ADALN_EMBED_DIM    = 256;
+     constexpr int SEQ_MULTI_OF       = 32;
+@@ -203,6 +214,9 @@ namespace ZImage {
+                 out_proj->set_force_prec_f32(true);
+                 qkv_proj->set_force_prec_f32(true);
+             }
++            if (z_image_out_prec_f32()) {
++                out_proj->set_force_prec_f32(true);
++            }
+ 
+             auto qkv = qkv_proj->forward(ctx, x);                                                                            // [N, n_token, (num_heads + num_kv_heads*2)*head_dim]
+             qkv      = ggml_reshape_4d(ctx->ggml_ctx, qkv, head_dim, num_heads + num_kv_heads * 2, qkv->ne[1], qkv->ne[2]);  // [N, n_token, num_heads + num_kv_heads*2, head_dim]
+@@ -279,7 +293,7 @@ namespace ZImage {
+             auto w2 = std::dynamic_pointer_cast<Linear>(blocks["w2"]);
+             auto w3 = std::dynamic_pointer_cast<Linear>(blocks["w3"]);
+ 
+-            if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
++            if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm") || z_image_out_prec_f32()) {
+                 w2->set_force_prec_f32(true);
+             }
+ 
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+index 921989d..faf9a2e 100644
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1,5 +1,7 @@
+ #include "model_manager.h"
+ 
++#include "ggml-backend-impl.h"
++
+ #include <algorithm>
+ #include <cstdint>
+ #include <iterator>
+@@ -894,6 +896,31 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
+                 return true;
+             }
+ 
++            if (params_buft->iface.alloc_buffer_n != nullptr) {
++                // Buffer types that place tensors themselves (the meta backend for tensor parallelism gives each
++                // device only its slice of every split tensor): a plain alloc_buffer(chunk_size) would reserve the
++                // whole chunk on every device.
++                std::vector<ggml_tensor*> tensors;
++                tensors.reserve(chunk.size());
++                for (TensorState* state : chunk) {
++                    tensors.push_back(state->tensor);
++                }
++                ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer_n(params_buft, tensors.data(), (int)tensors.size());
++                if (buffer == nullptr) {
++                    LOG_ERROR("model manager alloc params backend buffer failed, size = %.2fMB",
++                              chunk_size / (1024.0 * 1024.0));
++                    return false;
++                }
++                ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                auto block              = std::make_unique<ParamsStorageBlock>();
++                block->buffer           = buffer;
++                block->states           = chunk;
++                ParamsStorageBlock* raw = block.get();
++                params_storage_blocks_.push_back(std::move(block));
++                created_storage_blocks.push_back(raw);
++                return true;
++            }
++
+             ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(params_buft, chunk_size);
+             if (buffer == nullptr) {
+                 LOG_ERROR("model manager alloc params backend buffer failed, size = %.2fMB",
