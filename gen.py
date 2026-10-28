@@ -12,9 +12,14 @@ a.add_argument("--shift", type=float, default=3.0); a.add_argument("--batch", ty
 a.add_argument("--unet", default="z_image_turbo_bf16.safetensors"); a.add_argument("--clip", default="qwen_3_4b.safetensors")
 a.add_argument("--timeout", type=int, default=3600); a.add_argument("--frames", type=int, default=33)
 a.add_argument("--negative", default="blurry, low quality, static, subtitles, watermark, distorted, extra limbs")
-a.add_argument("--model", default="zimage", choices=["zimage", "klein", "qwen21", "krea2", "wan21", "wan22"])
+a.add_argument("--model", default="zimage", choices=["zimage", "klein", "qwen21", "krea2", "wan21", "wan22", "ltx25"])
 a.add_argument("--enhance", action="store_true", help="run the template's prompt rewriter first (qwen21, krea2)"); a.add_argument("--thinking", action="store_true")
 a.add_argument("--pe", default="qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors"); a.add_argument("--sysprompts", default="/data/imagegen/sysprompts.json"); a.add_argument("--vae", default=None); a.add_argument("--cfg", type=float, default=1.0)
+a.add_argument("--start-image", default=None, help="wan22 only: image file (on the machine running gen.py) used as the first frame, so a later shot keeps the same person")
+a.add_argument("--fps", type=int, default=24); a.add_argument("--avae", default="ltx-2.5-audio-vae-bf16.safetensors")  # ltx25 only
+a.add_argument("--upscaler", default="ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors")
+a.add_argument("--vae-tile", type=int, default=512); a.add_argument("--vae-overlap", type=int, default=64)  # ltx25 tiled decode; the 512/64/64/16 template values need > 14 GB of host RAM at 1024x1024 x 97 frames on --cpu-vae
+a.add_argument("--vae-t", type=int, default=64); a.add_argument("--vae-t-overlap", type=int, default=16)
 o = a.parse_args()
 if o.model == "klein":  # FLUX.2 klein 4B distilled defaults, from the official ComfyUI template
     if o.unet == "z_image_turbo_bf16.safetensors": o.unet = "flux-2-klein-4b.safetensors"
@@ -22,7 +27,8 @@ if o.model == "klein":  # FLUX.2 klein 4B distilled defaults, from the official 
 a2 = {"qwen21": ("qwen_image_2.1_turbo_int8_convrot.safetensors", "qwen3vl_8b_int8_convrot.safetensors", "qwen_image_2.1_vae_bf16.safetensors", "euler"),
       "krea2": ("krea2_turbo_int8_convrot.safetensors", "qwen3vl_4b_fp8_scaled.safetensors", "qwen_image_vae.safetensors", "euler"),
       "wan21": ("wan2.1_t2v_1.3B_fp16.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan_2.1_vae.safetensors", "uni_pc"),
-      "wan22": ("wan2.2_ti2v_5B_fp16.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan2.2_vae.safetensors", "uni_pc")}
+      "wan22": ("wan2.2_ti2v_5B_fp16.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "wan2.2_vae.safetensors", "uni_pc"),
+      "ltx25": ("ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf", "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors", "ltx-2.5-video-vae-bf16.safetensors", "euler_ancestral")}
 if o.model in a2:
     if o.unet == "z_image_turbo_bf16.safetensors": o.unet = a2[o.model][0]
     if o.clip == "qwen_3_4b.safetensors": o.clip = a2[o.model][1]
@@ -120,6 +126,49 @@ if o.model in ("wan21", "wan22"):  # Wan 2.1 1.3B / Wan 2.2 5B text-to-video, wi
     for j, idx in enumerate(sorted({0, o.frames // 2, o.frames - 1})):  # also save three still frames for a quick look
         wf[str(20 + j)] = {"class_type": "ImageFromBatch", "inputs": {"image": ["9", 0], "batch_index": idx, "length": 1}}
         wf[str(30 + j)] = {"class_type": "SaveImage", "inputs": {"images": [str(20 + j), 0], "filename_prefix": f"{o.prefix}_f{idx:03d}"}}
+if o.model == "ltx25":  # LTX-2.5 distilled 22B (GGUF), video + audio in one pass; wiring from the official "Text to Video (LTX-2.5)" template:
+    # stage 1 at half size (8 steps), 2x latent upscale, stage 2 refine (3 steps). --w/--h are the FINAL size (multiples of 64); --frames must be 8k+1.
+    neg = o.negative if o.negative != "blurry, low quality, static, subtitles, watermark, distorted, extra limbs" else "pc game, console game, video game, cartoon, childish, ugly"
+    wf = {
+     "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": o.unet}},
+     "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": o.clip, "type": "ltxv", "device": "default"}},
+     "3": {"class_type": "VAELoader", "inputs": {"vae_name": o.vae}},
+     "4": {"class_type": "VAELoader", "inputs": {"vae_name": o.avae}},
+     "5": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": o.upscaler}},
+     "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": o.prompt}},
+     "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": neg}},
+     "8": {"class_type": "LTXVConditioning", "inputs": {"positive": ["6", 0], "negative": ["7", 0], "frame_rate": float(o.fps)}},
+     "9": {"class_type": "EmptyLTXVLatentVideo", "inputs": {"width": o.w // 2, "height": o.h // 2, "length": o.frames, "batch_size": 1}},
+     "10": {"class_type": "LTXVEmptyLatentAudio", "inputs": {"frames_number": o.frames, "frame_rate": o.fps, "batch_size": 1, "audio_vae": ["4", 0]}},
+     "11": {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": ["9", 0], "audio_latent": ["10", 0]}},
+     "12": {"class_type": "LTXVDualCFGGuider", "inputs": {"model": ["1", 0], "positive": ["8", 0], "negative": ["8", 1], "video_cfg": 1.0, "audio_cfg": 1.0}},
+     "13": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
+     "14": {"class_type": "ManualSigmas", "inputs": {"sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"}},
+     "15": {"class_type": "RandomNoise", "inputs": {"noise_seed": o.seed}},
+     "16": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["15", 0], "guider": ["12", 0], "sampler": ["13", 0], "sigmas": ["14", 0], "latent_image": ["11", 0]}},
+     "17": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["16", 0]}},
+     "18": {"class_type": "LTXVLatentUpsampler", "inputs": {"samples": ["17", 0], "upscale_model": ["5", 0], "vae": ["3", 0]}},
+     "19": {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": ["18", 0], "audio_latent": ["17", 1]}},
+     "20": {"class_type": "ManualSigmas", "inputs": {"sigmas": "0.85, 0.7250, 0.4219, 0.0"}},
+     "21": {"class_type": "RandomNoise", "inputs": {"noise_seed": o.seed}},
+     "22": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["21", 0], "guider": ["12", 0], "sampler": ["13", 0], "sigmas": ["20", 0], "latent_image": ["19", 0]}},
+     "23": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["22", 0]}},
+     "9a": {"class_type": "VAEDecodeTiled", "inputs": {"samples": ["23", 0], "vae": ["3", 0], "tile_size": o.vae_tile, "overlap": o.vae_overlap, "temporal_size": o.vae_t, "temporal_overlap": o.vae_t_overlap}},
+     "26": {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["23", 1], "audio_vae": ["4", 0]}},
+     "27": {"class_type": "CreateVideo", "inputs": {"images": ["9a", 0], "fps": float(o.fps), "audio": ["26", 0]}},
+     "28": {"class_type": "SaveVideo", "inputs": {"video": ["27", 0], "filename_prefix": o.prefix, "format": "auto", "codec": "auto"}},
+    }
+    for j, idx in enumerate(sorted({0, o.frames // 2, o.frames - 1})):
+        wf[str(40 + j)] = {"class_type": "ImageFromBatch", "inputs": {"image": ["9a", 0], "batch_index": idx, "length": 1}}
+        wf[str(50 + j)] = {"class_type": "SaveImage", "inputs": {"images": [str(40 + j), 0], "filename_prefix": f"{o.prefix}_f{idx:03d}"}}
+if o.start_image:  # upload into ComfyUI's input folder and feed it to Wan 2.2's start_image
+    import os, uuid
+    bnd = uuid.uuid4().hex; nm = os.path.basename(o.start_image)
+    mp = (f'--{bnd}\r\nContent-Disposition: form-data; name="image"; filename="{nm}"\r\nContent-Type: image/png\r\n\r\n').encode() + open(o.start_image, "rb").read() + \
+         (f'\r\n--{bnd}\r\nContent-Disposition: form-data; name="overwrite"\r\n\r\ntrue\r\n--{bnd}--\r\n').encode()
+    up = json.loads(urllib.request.urlopen(urllib.request.Request(U + "/upload/image", data=mp, headers={"Content-Type": f"multipart/form-data; boundary={bnd}"}), timeout=120).read())
+    wf["60"] = {"class_type": "LoadImage", "inputs": {"image": up["name"]}}
+    wf["6"]["inputs"]["start_image"] = ["60", 0]
 def call(path, body=None):
     req = urllib.request.Request(U + path, data=json.dumps(body).encode() if body is not None else None, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r: return json.loads(r.read())
@@ -128,7 +177,7 @@ try:
     pid = call("/prompt", {"prompt": wf})["prompt_id"]
 except urllib.error.HTTPError as e:
     print(json.dumps({"prefix": o.prefix, "error": e.read().decode()[:1500]})); raise SystemExit(1)
-res = {"enhance": o.enhance, "prefix": o.prefix, "w": o.w, "h": o.h, "steps": o.steps, "seed": o.seed, "sampler": o.sampler, "scheduler": o.scheduler, "dtype": o.dtype, "batch": o.batch, "unet": o.unet, "clip": o.clip, "model": o.model, "frames": o.frames if o.model in ("wan21", "wan22") else 1, "cfg": o.cfg}
+res = {"enhance": o.enhance, "prefix": o.prefix, "w": o.w, "h": o.h, "steps": o.steps, "seed": o.seed, "sampler": o.sampler, "scheduler": o.scheduler, "dtype": o.dtype, "batch": o.batch, "unet": o.unet, "clip": o.clip, "model": o.model, "frames": o.frames if o.model in ("wan21", "wan22", "ltx25") else 1, "cfg": o.cfg}
 while time.time() - t0 < o.timeout:
     h = call(f"/history/{pid}")
     if pid in h:

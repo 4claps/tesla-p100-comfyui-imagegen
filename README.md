@@ -12,7 +12,7 @@ Everything GPU-side runs in a container built from these files. Models and outpu
 | `Dockerfile.p100`, `patch_int8.py` | Small image on top with the two P100 fixes (JIT switch, INT8 fallback) -> `p100-imagegen:p100` |
 | `compose.yml` | Four ComfyUI instances, one per card, ports 8188-8191 (not auto-started) |
 | `gen.py` | Command-line client: queues one job on a ComfyUI instance and waits (Z-Image, FLUX.2 klein, Qwen-Image 2.1, Krea 2, Wan video) |
-| `setup.sh`, `dl2.sh` ... `dl5.sh`, `dl5.list` | Image build and model downloads (run inside the container) |
+| `setup.sh`, `dl2.sh` ... `dl6.sh`, `dl5.list`, `dl6.list` | Image build and model downloads (run inside the container) |
 | `lib.sh`, `prompts.sh` | Benchmark helpers: container start, cool-down, temperature/fan/clock guard, the fixed prompt set |
 | `suite.sh`, `ksweep.sh`, `sustained.sh`, `bench*.sh`, `vbench*.sh`, `tchain.sh` | The benchmark scripts behind each section of `RESULTS.md` |
 | `mkindex.py` | Builds one browse page for everything in the output folder |
