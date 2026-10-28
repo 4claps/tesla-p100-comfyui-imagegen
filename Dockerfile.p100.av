@@ -1,0 +1,7 @@
+# Layer on top of p100-imagegen:p100 for the audio experiments: dependencies of ComfyUI-GGUF (LTX-2.5 GGUF loader)
+# and ComfyUI-HunyuanVideo-Foley (video-to-audio). The nodes themselves are bind-mounted from /data/imagegen/custom_nodes.
+# torch / torchvision / torchaudio are pinned by the constraints file so pip cannot replace the cu126 builds.
+FROM p100-imagegen:p100
+RUN pip freeze | grep -E '^(torch|torchvision|torchaudio|numpy|transformers|safetensors)==' > /tmp/constraints.txt \
+ && pip install --no-cache-dir -c /tmp/constraints.txt 'gguf>=0.13.0' sentencepiece protobuf scipy diffusers timm accelerate einops pyyaml omegaconf loguru tqdm \
+ && pip check || true
